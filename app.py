@@ -5,40 +5,71 @@ import sqlite3
 import uuid
 import argparse
 import os
+import asyncio
+import aiohttp
+import sys
+
+# --- CRITICAL FIX FOR WINDOWS ---
+# Playwright requires ProactorEventLoop on Windows to run subprocesses (browsers).
+# Streamlit/Python might default to SelectorEventLoop, which causes the NotImplementedError.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+# --------------------------------
+
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 from urllib.parse import urlparse
 
-import httpx
-from dateutil import parser as dateparser
-from rapidfuzz import fuzz
-from playwright.sync_api import sync_playwright
+# Use async playwright
+from playwright.async_api import async_playwright
 import trafilatura
 
+# PDF Generation - Improved with Platypus for text wrapping
 from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
 from reportlab.lib.units import cm
+from reportlab.lib import colors
 
-
-# UI deps are imported only when running streamlit mode
-# (so CLI scans can run even if streamlit isn't installed in a minimal env)
+# UI deps
 try:
     import streamlit as st
+    import nest_asyncio
+    # Apply nest_asyncio to allow asyncio to run inside Streamlit
+    nest_asyncio.apply()
 except Exception:
     st = None
 
-SEARXNG_URL = "http://localhost:8080/search"  # local searxng JSON enabled
-DB_PATH = "data/cache.sqlite"
-USER_AGENT = "Mozilla/5.0 (compatible; CompanyResearchAgent/0.1; +http://localhost)"
-DEFAULT_TIMEOUT = 15
+# separate block for asyncio compatibility
+if st is not None:
+    try:
+        import nest_asyncio
+        nest_asyncio.apply()
+    except ImportError:
+        # Stop the app with a clear error if nest_asyncio is missing
+        st.error("Missing dependency: Please run 'pip install nest_asyncio'")
+        st.stop()
 
-# --------------------------- storage ---------------------------
+# --- Configuration via Env Vars ---
+SEARXNG_URL = os.getenv("SEARXNG_URL", "http://localhost:8080/search")
+# Default to a local LLM (e.g., Ollama) or set to https://api.openai.com/v1
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:11434/v1") 
+LLM_API_KEY = os.getenv("LLM_API_KEY", "ollama") # Use 'sk-...' for OpenAI
+LLM_MODEL = os.getenv("LLM_MODEL", "llama3") # or 'gpt-4o', etc.
+
+DB_PATH = "data/cache.sqlite"
+USER_AGENT = "Mozilla/5.0 (compatible; CompanyResearchAgent/0.2; +http://localhost)"
+DEFAULT_TIMEOUT = 15
+MAX_CONCURRENT_BROWSERS = 3  # Limit playwright tabs to avoid resource exhaustion
+
+# --------------------------- Storage (SQLite) ---------------------------
 
 def ensure_db():
-    import os
     os.makedirs("data", exist_ok=True)
     with sqlite3.connect(DB_PATH) as con:
+        # Enable WAL mode for better concurrency
+        con.execute("PRAGMA journal_mode=WAL;")
         con.execute("""
         CREATE TABLE IF NOT EXISTS docs (
           url TEXT PRIMARY KEY,
@@ -54,10 +85,16 @@ def ensure_db():
         CREATE TABLE IF NOT EXISTS runs (
           run_id TEXT PRIMARY KEY,
           query TEXT,
-          created_at TEXT
+          created_at TEXT,
+          llm_summary TEXT
         )
         """)
-        # run metadata for comparisons
+        # Schema update for existing DBs to add llm_summary
+        try:
+            con.execute("ALTER TABLE runs ADD COLUMN llm_summary TEXT")
+        except Exception:
+            pass
+
         con.execute("""
         CREATE TABLE IF NOT EXISTS run_meta (
           run_id TEXT PRIMARY KEY,
@@ -67,7 +104,6 @@ def ensure_db():
           created_at TEXT
         )
         """)
-        # mapping run -> urls (+ bucket)
         con.execute("""
         CREATE TABLE IF NOT EXISTS run_docs (
           run_id TEXT,
@@ -80,7 +116,6 @@ def ensure_db():
           PRIMARY KEY(run_id, url)
         )
         """)
-        # watchlist
         con.execute("""
         CREATE TABLE IF NOT EXISTS watchlist (
           company_key TEXT PRIMARY KEY,
@@ -91,6 +126,7 @@ def ensure_db():
         )
         """)
 
+# Synchronous DB helpers (SQLite handles simple concurrency well enough for this scale)
 def upsert_doc(doc: Dict[str, Any]):
     with sqlite3.connect(DB_PATH) as con:
         con.execute("""
@@ -120,65 +156,45 @@ def get_cached(url: str) -> Optional[Dict[str, Any]]:
         if not row:
             return None
         return {
-            "url": row[0],
-            "title": row[1],
-            "published_at": row[2],
-            "source": row[3],
-            "snippet": row[4],
-            "text": row[5],
-            "fetched_at": row[6],
+            "url": row[0], "title": row[1], "published_at": row[2],
+            "source": row[3], "snippet": row[4], "text": row[5], "fetched_at": row[6],
         }
 
-def record_run(run_id: str, query: str):
+def record_run(run_id: str, query: str, summary: str = ""):
     with sqlite3.connect(DB_PATH) as con:
-        con.execute("INSERT INTO runs(run_id, query, created_at) VALUES(?,?,?)",
-                    (run_id, query, datetime.now().isoformat()))
+        con.execute("INSERT INTO runs(run_id, query, created_at, llm_summary) VALUES(?,?,?,?)",
+                    (run_id, query, datetime.now().isoformat(), summary))
 
 def record_run_meta(run_id: str, company_key_: str, input_value: str, days: int):
     with sqlite3.connect(DB_PATH) as con:
-        con.execute("""
-          INSERT INTO run_meta(run_id, company_key, input_value, days, created_at)
-          VALUES(?,?,?,?,?)
-        """, (run_id, company_key_, input_value, int(days), datetime.now().isoformat()))
+        con.execute("INSERT INTO run_meta(run_id, company_key, input_value, days, created_at) VALUES(?,?,?,?,?)",
+                    (run_id, company_key_, input_value, int(days), datetime.now().isoformat()))
 
 def record_run_doc(run_id: str, bucket: str, doc: Dict[str, Any], score: float):
     with sqlite3.connect(DB_PATH) as con:
         con.execute("""
           INSERT OR REPLACE INTO run_docs(run_id, bucket, url, title, source, published_at, score)
           VALUES(?,?,?,?,?,?,?)
-        """, (
-            run_id,
-            bucket,
-            doc.get("url"),
-            doc.get("title"),
-            doc.get("source"),
-            doc.get("published_at"),
-            float(score),
-        ))
+        """, (run_id, bucket, doc.get("url"), doc.get("title"), doc.get("source"), doc.get("published_at"), float(score)))
 
 def get_last_run_id(company_key_: str) -> Optional[str]:
     with sqlite3.connect(DB_PATH) as con:
-        cur = con.execute("""
-          SELECT run_id FROM run_meta
-          WHERE company_key=?
-          ORDER BY created_at DESC
-          LIMIT 1
-        """, (company_key_,))
+        cur = con.execute("SELECT run_id FROM run_meta WHERE company_key=? ORDER BY created_at DESC LIMIT 1", (company_key_,))
         row = cur.fetchone()
     return row[0] if row else None
 
-def get_run_docs(run_id: str) -> List[Dict[str, Any]]:
+def get_run_data(run_id: str):
     with sqlite3.connect(DB_PATH) as con:
-        cur = con.execute("""
-          SELECT bucket, url, title, source, published_at, score
-          FROM run_docs
-          WHERE run_id=?
-        """, (run_id,))
-        rows = cur.fetchall()
-    return [
-        {"bucket": r[0], "url": r[1], "title": r[2], "source": r[3], "published_at": r[4], "score": r[5]}
-        for r in rows
-    ]
+        # Get docs
+        cur = con.execute("SELECT bucket, url, title, source, published_at, score FROM run_docs WHERE run_id=?", (run_id,))
+        docs = [{"bucket": r[0], "url": r[1], "title": r[2], "source": r[3], "published_at": r[4], "score": r[5]} for r in cur.fetchall()]
+        
+        # Get summary
+        cur = con.execute("SELECT llm_summary FROM runs WHERE run_id=?", (run_id,))
+        row = cur.fetchone()
+        summary = row[0] if row else ""
+        
+    return docs, summary
 
 def add_to_watchlist(entity: Dict[str, str], original_input: str):
     key = company_key(entity)
@@ -188,9 +204,7 @@ def add_to_watchlist(entity: Dict[str, str], original_input: str):
         con.execute("""
         INSERT INTO watchlist(company_key, label, input_value, created_at, last_run_id)
         VALUES(?,?,?,?,?)
-        ON CONFLICT(company_key) DO UPDATE SET
-          label=excluded.label,
-          input_value=excluded.input_value
+        ON CONFLICT(company_key) DO UPDATE SET label=excluded.label, input_value=excluded.input_value
         """, (key, label, original_input, now, None))
 
 def remove_from_watchlist(company_key_: str):
@@ -199,22 +213,15 @@ def remove_from_watchlist(company_key_: str):
 
 def list_watchlist() -> List[Dict[str, Any]]:
     with sqlite3.connect(DB_PATH) as con:
-        cur = con.execute("""
-          SELECT company_key, label, input_value, created_at, last_run_id
-          FROM watchlist
-          ORDER BY created_at DESC
-        """)
+        cur = con.execute("SELECT company_key, label, input_value, created_at, last_run_id FROM watchlist ORDER BY created_at DESC")
         rows = cur.fetchall()
-    return [
-        {"company_key": r[0], "label": r[1], "input_value": r[2], "created_at": r[3], "last_run_id": r[4]}
-        for r in rows
-    ]
+    return [{"company_key": r[0], "label": r[1], "input_value": r[2], "created_at": r[3], "last_run_id": r[4]} for r in rows]
 
 def update_watchlist_last_run(company_key_: str, run_id: str):
     with sqlite3.connect(DB_PATH) as con:
         con.execute("UPDATE watchlist SET last_run_id=? WHERE company_key=?", (run_id, company_key_))
 
-# --------------------------- utils ---------------------------
+# --------------------------- Utils ---------------------------
 
 def is_domain_like(s: str) -> bool:
     return bool(re.match(r"^(https?://)?([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}(/.*)?$", s.strip()))
@@ -232,46 +239,13 @@ def normalize_company_input(q: str) -> Dict[str, str]:
 def company_key(entity: Dict[str, str]) -> str:
     return (entity.get("domain") or entity["company"]).strip().lower()
 
-def parse_date_guess(text: Optional[str]) -> Optional[str]:
-    if not text:
-        return None
-    try:
-        dt = dateparser.parse(text, fuzzy=True)
-        if dt:
-            return dt.isoformat()
-    except Exception:
-        return None
-    return None
-
 def host_from_url(url: str) -> str:
     try:
         return urlparse(url).netloc.replace("www.", "")
     except Exception:
         return ""
 
-def compute_delta(prev_docs: List[Dict[str, Any]], curr_docs: List[Dict[str, Any]]) -> Dict[str, Any]:
-    prev_set = {d["url"] for d in prev_docs}
-    curr_set = {d["url"] for d in curr_docs}
-
-    new_urls = curr_set - prev_set
-    gone_urls = prev_set - curr_set
-
-    new_items = [d for d in curr_docs if d["url"] in new_urls]
-    gone_items = [d for d in prev_docs if d["url"] in gone_urls]
-
-    def group(items):
-        out: Dict[str, List[Dict[str, Any]]] = {}
-        for it in items:
-            out.setdefault(it["bucket"], []).append(it)
-        return out
-
-    return {
-        "new": group(new_items),
-        "gone": group(gone_items),
-        "counts": {"new": len(new_items), "gone": len(gone_items)},
-    }
-
-# --------------------------- search ---------------------------
+# --------------------------- Async Search & Fetch ---------------------------
 
 @dataclass
 class SearchItem:
@@ -280,770 +254,378 @@ class SearchItem:
     snippet: str
     engine: str
 
-def searxng_search(query: str, language: str = "en", time_range: Optional[str] = None,
-                  limit: int = 100, pages: int = 3) -> List[SearchItem]:
-    """Query local SearXNG and return up to `limit` results, optionally paginating across `pages`."""
-    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
-    all_items: List[SearchItem] = []
+async def searxng_search_async(session: aiohttp.ClientSession, query: str, language: str = "en", time_range: Optional[str] = None, limit: int = 20) -> List[SearchItem]:
+    """Async query to local SearXNG."""
+    params = {"q": query, "format": "json", "language": language}
+    if time_range:
+        params["time_range"] = time_range
 
-    with httpx.Client(timeout=DEFAULT_TIMEOUT, headers=headers) as client:
-        for pageno in range(1, pages + 1):
-            params = {"q": query, "format": "json", "language": language, "pageno": pageno}
-            if time_range:
-                params["time_range"] = time_range
-
-            r = client.get(SEARXNG_URL, params=params)
-            r.raise_for_status()
-            data = r.json()
-
+    try:
+        async with session.get(SEARXNG_URL, params=params, timeout=10) as resp:
+            if resp.status != 200:
+                return []
+            data = await resp.json()
+            items = []
             for item in data.get("results", []):
-                all_items.append(SearchItem(
+                items.append(SearchItem(
                     title=item.get("title") or "",
                     url=item.get("url") or "",
                     snippet=item.get("content") or "",
                     engine=item.get("engine") or ""
                 ))
-
-    all_items = dedupe_by_url(all_items)
-    return all_items[:limit]
-
-def build_queries(entity: Dict[str, str], days: int) -> Dict[str, List[str]]:
-    """Return multiple simpler queries per bucket to improve recall."""
-    base = entity["company"]
-    domain = entity.get("domain") or ""
-    key = f'"{base}"'  # quoted for precision
-
-    news_base = key
-    if domain:
-        # include domain as an additional anchor in news queries
-        news_base = f'({key} OR "{domain}")'
-
-    return {
-        "news": [
-            f'{news_base} (funding OR raises OR "raised" OR investment OR "Series A" OR "Series B")',
-            f'{news_base} (acquisition OR acquired OR merger OR "strategic stake")',
-            f'{news_base} (lawsuit OR investigation OR regulator OR "data breach" OR cybersecurity OR outage)',
-            f'{news_base} (layoffs OR hiring OR expansion OR "opens" OR "launches")',
-        ],
-        "reviews": [
-            f'{key} (Glassdoor OR Indeed OR AmbitionBox OR Kununu) reviews',
-            f'"{base}" employee reviews',
-        ],
-        "chatter": [
-            f'{key} site:reddit.com',
-            f'{key} (forum OR community OR "discussion")',
-        ],
-        "company_site": [
-            f'site:{domain} (press OR newsroom OR blog OR "press release")' if domain else f'{key} (press release OR newsroom OR blog)',
-            f'site:{domain} (careers OR jobs OR "we are hiring")' if domain else f'{key} (careers OR jobs)',
-        ],
-        "people": [
-            f'{key} (CEO OR CTO OR CFO OR "appointed" OR "joins" OR "steps down")',
-            f'{key} ("board of directors" OR "executive team")',
-        ],
-    }
-
-# --------------------------- fetch + extract ---------------------------
+            return items
+    except Exception as e:
+        print(f"Search Error ({query}): {type(e).__name__} - {e}")
+        return []
 
 def extract_with_trafilatura(html: str) -> Dict[str, Any]:
-    downloaded = trafilatura.extract(
-        html,
-        include_comments=False,
-        include_tables=False,
-        with_metadata=True,
-        output_format="json"
-    )
+    downloaded = trafilatura.extract(html, include_comments=False, include_tables=False, with_metadata=True, output_format="json")
     if not downloaded:
         return {"title": "", "text": "", "published_at": None}
-
     j = json.loads(downloaded)
-    text = (j.get("text") or "").strip()
-    title = (j.get("title") or "").strip()
-    published_at = parse_date_guess(j.get("date")) or parse_date_guess(j.get("publication_date"))
-    return {"title": title, "text": text, "published_at": published_at}
+    return {"title": (j.get("title") or "").strip(), "text": (j.get("text") or "").strip(), "published_at": j.get("date")}
 
-def playwright_get_html(url: str) -> str:
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(user_agent=USER_AGENT)
-        page = context.new_page()
-        page.set_default_timeout(15000)
-
-        page.goto(url, wait_until="domcontentloaded")
-        try:
-            page.wait_for_load_state("networkidle", timeout=8000)
-        except Exception:
-            pass
-
-        html = page.content()
-        context.close()
-        browser.close()
-        return html
-
-def fetch_and_extract(url: str, use_playwright: bool) -> Dict[str, Any]:
-    cached = get_cached(url)
-    if cached and cached.get("fetched_at"):
-        try:
-            fetched_at = dateparser.parse(cached["fetched_at"])
-            if datetime.now() - fetched_at < timedelta(hours=24):
-                return cached
-        except Exception:
-            pass
-
-    headers = {"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"}
-    fetched_at = datetime.now().isoformat()
-
-    title, text, published_at = "", "", None
-
-    # 1) HTTP first
+async def fetch_url_playwright(context, url: str) -> str:
+    """Fetch a single URL using an existing Playwright browser context."""
+    page = await context.new_page()
     try:
-        with httpx.Client(timeout=DEFAULT_TIMEOUT, headers=headers, follow_redirects=True) as client:
-            r = client.get(url)
-            r.raise_for_status()
-            html = r.text
-        out = extract_with_trafilatura(html)
-        title, text, published_at = out["title"], out["text"], out["published_at"]
+        await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+        content = await page.content()
+        return content
+    except Exception:
+        return ""
+    finally:
+        await page.close()
+
+async def fetch_and_extract_async(session: aiohttp.ClientSession, browser_context, url: str, use_playwright: bool) -> Dict[str, Any]:
+    # Check cache first
+    cached = get_cached(url)
+    if cached and cached.get("text"):
+         # Simple freshness check (optional: add logic to re-fetch if old)
+         return cached
+
+    html = ""
+    # 1. Try fast HTTP fetch
+    try:
+        async with session.get(url, timeout=10, headers={"User-Agent": USER_AGENT}) as resp:
+            if resp.status == 200:
+                html = await resp.text()
     except Exception:
         pass
 
-    # 2) Playwright fallback
-    if use_playwright and ((not text) or (len(text) < 400)):
-        try:
-            html2 = playwright_get_html(url)
-            out2 = extract_with_trafilatura(html2)
-            if len(out2["text"] or "") > len(text or ""):
-                title, text, published_at = out2["title"], out2["text"], out2["published_at"]
-        except Exception:
-            pass
+    out = extract_with_trafilatura(html)
+    text = out["text"]
+
+    # 2. Fallback to Playwright if text is too short
+    if use_playwright and browser_context and len(text) < 500:
+        html_pw = await fetch_url_playwright(browser_context, url)
+        out_pw = extract_with_trafilatura(html_pw)
+        if len(out_pw["text"]) > len(text):
+            out = out_pw
 
     doc = {
         "url": url,
-        "title": title,
-        "published_at": published_at,
+        "title": out["title"],
+        "published_at": out["published_at"],
         "source": host_from_url(url),
         "snippet": "",
-        "text": text or "",
-        "fetched_at": fetched_at,
+        "text": out["text"],
+        "fetched_at": datetime.now().isoformat(),
     }
+    # Sync write to DB (fast enough for SQLite WAL)
     upsert_doc(doc)
     return doc
 
-# --------------------------- ranking ---------------------------
+# --------------------------- LLM Analysis ---------------------------
 
-def score_item(entity: Dict[str, str], item: SearchItem) -> float:
-    company = entity["company"].lower()
-    domain = (entity.get("domain") or "").lower()
+async def analyze_with_llm(session: aiohttp.ClientSession, company: str, docs_by_bucket: Dict[str, List[Dict[str, Any]]]) -> str:
+    """
+    Sends aggregated text to the configured LLM for an executive summary.
+    """
+    if not docs_by_bucket:
+        return "No data found to analyze."
 
-    MAJOR_SOURCES = {"reuters.com","bloomberg.com","ft.com","wsj.com","economictimes.indiatimes.com",
-                 "techcrunch.com","theverge.com","business-standard.com","livemint.com"}
+    # Prepare context
+    context_lines = []
+    for bucket, docs in docs_by_bucket.items():
+        if not docs: continue
+        context_lines.append(f"--- SECTION: {bucket.upper()} ---")
+        for d in docs[:4]: # Top 4 per bucket to save context window
+            txt = (d.get("text") or "")[:800].replace("\n", " ") # Truncate
+            context_lines.append(f"Title: {d.get('title')}\nSource: {d.get('source')}\nContent: {txt}\n")
+    
+    context_str = "\n".join(context_lines)
+    
+    prompt = f"""
+    You are a professional market research agent. 
+    Analyze the following recent information about the company '{company}'.
+    
+    Write a concise Executive Briefing that covers:
+    1. Key recent news or events (focus on facts).
+    2. Strategic moves (launches, mergers, leadership changes).
+    3. Market sentiment (if available from reviews/chatter).
+    
+    Data Context:
+    {context_str}
+    
+    Format: Markdown. Be professional, objective, and cite sources by name if specific.
+    """
 
-    t = (item.title or "").lower()
-    u = (item.url or "").lower()
-    s = (item.snippet or "").lower()
+    payload = {
+        "model": LLM_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.3
+    }
 
-    score = 0.0
-    score += 2.0 if company in t else 0.0
-    score += 1.5 if company in s else 0.0
-    score += 2.0 if (domain and domain in u) else 0.0
-    score += (fuzz.partial_ratio(company, t) / 100.0)
-
-    host = host_from_url(item.url)
-    if host.count(".") <= 1:
-        score += 0.2
-    if any(host.endswith(d) for d in MAJOR_SOURCES):
-        score += 1.5
-    return score
-
-def dedupe_by_url(items: List[SearchItem]) -> List[SearchItem]:
-    seen = set()
-    out = []
-    for it in items:
-        if it.url and it.url not in seen:
-            seen.add(it.url)
-            out.append(it)
-    return out
-
-# --------------------------- reporting ---------------------------
-
-def fmt_pub(pub: Optional[str]) -> str:
-    if not pub:
-        return ""
+    headers = {"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"}
+    
     try:
-        return dateparser.parse(pub).strftime("%Y-%m-%d")
-    except Exception:
-        return pub
+        # Generic OpenAI-compatible endpoint
+        async with session.post(f"{LLM_BASE_URL}/chat/completions", json=payload, headers=headers, timeout=60) as resp:
+            if resp.status == 200:
+                res_json = await resp.json()
+                return res_json["choices"][0]["message"]["content"]
+            else:
+                err = await resp.text()
+                return f"LLM Analysis Failed: {resp.status} - {err}"
+    except Exception as e:
+        return f"LLM Connection Error: {e}"
 
-def brief_markdown(entity: Dict[str, str], buckets: Dict[str, List[Dict[str, Any]]], days: int, run_id: str, delta: Optional[Dict[str, Any]] = None) -> str:
-    title = entity["company"]
-    lines = []
-    lines.append(f"# Company brief: {title}")
-    lines.append("")
-    lines.append(f"_Collected on {datetime.now().strftime('%Y-%m-%d %H:%M')} (local). Window: last ~{days} days where possible._")
-    lines.append(f"_Run ID: {run_id}_")
-    lines.append("")
+# --------------------------- Core Scan Logic ---------------------------
 
-    if delta:
-        lines.append("## Changes since last scan")
-        lines.append(f"- New items: **{delta['counts']['new']}**")
-        lines.append(f"- Disappeared items: **{delta['counts']['gone']}**")
-        lines.append("")
+def build_queries(entity: Dict[str, str], days: int) -> Dict[str, List[str]]:
+    base = entity["company"]
+    domain = entity.get("domain") or ""
+    key = f'"{base}"'
+    return {
+        "news": [f'{key} (funding OR acquisition OR launch OR lawsuit)', f'{key} business news'],
+        "reviews": [f'{key} reviews', f'site:reddit.com {key}'],
+        "people": [f'{key} (CEO OR CFO OR executive team)'],
+    }
 
-        if delta["counts"]["new"] > 0:
-            lines.append("### New items")
-            for bucket, items in delta["new"].items():
-                lines.append(f"**{bucket.replace('_',' ').title()}**")
-                for it in items:
-                    lines.append(f"- {it.get('title') or it['url']} ({it.get('source','')})")
-                    lines.append(f"  - {it['url']}")
-            lines.append("")
-
-    for k, docs in buckets.items():
-        lines.append(f"## {k.replace('_', ' ').title()}")
-        if not docs:
-            lines.append("- (No results)")
-            lines.append("")
-            continue
-
-        for d in docs:
-            pub_str = fmt_pub(d.get("published_at"))
-            lines.append(f"- **{d.get('title') or '(untitled)'}**{(' — ' + pub_str) if pub_str else ''}")
-            lines.append(f"  - Source: {d.get('source')}")
-            lines.append(f"  - URL: {d.get('url')}")
-        lines.append("")
-    return "\n".join(lines)
-
-def ensure_dir(path: str):
-    import os
-    os.makedirs(path, exist_ok=True)
-
-def safe_filename(s: str) -> str:
-    s = s.strip().lower()
-    s = re.sub(r"[^a-z0-9._-]+", "-", s)
-    return s[:80] if len(s) > 80 else s
-
-# --------------------------- core scan (shared by UI + CLI) ---------------------------
-
-def run_scan(company_input: str, days: int, per_bucket: int, use_playwright: bool, deep_scan: bool = False) -> Dict[str, Any]:
+async def run_scan_async(company_input: str, days: int, per_bucket: int, use_playwright: bool):
     ensure_db()
     entity = normalize_company_input(company_input)
     ckey = company_key(entity)
-
-    prev_run_id = get_last_run_id(ckey)
-
     run_id = str(uuid.uuid4())
-    record_run(run_id, query=company_input)
-    record_run_meta(run_id, ckey, company_input, days)
-
+    
     queries = build_queries(entity, days)
+    
+    async with aiohttp.ClientSession() as session:
+        # 1. Parallel Search
+        search_tasks = []
+        bucket_map = [] # Keep track of which task belongs to which bucket
+        
+        for bucket, query_list in queries.items():
+            for q in query_list:
+                search_tasks.append(searxng_search_async(session, q, limit=per_bucket))
+                bucket_map.append(bucket)
+        
+        search_results = await asyncio.gather(*search_tasks)
+        
+        # Organize results
+        buckets_raw = {}
+        for i, items in enumerate(search_results):
+            bucket = bucket_map[i]
+            if bucket not in buckets_raw: buckets_raw[bucket] = []
+            buckets_raw[bucket].extend(items)
 
-    # Deep scan pulls more candidates and pages (slower, better recall)
-    pages = 5 if deep_scan else 3
-    limit = 200 if deep_scan else 100
-    # Keep per_bucket as provided (UI can increase it for deep scan too)
+        # 2. Fetch Content (Parallel)
+        pw_context = None
+        pw_browser = None
+        playwright_obj = None
 
-    buckets_raw: Dict[str, List[SearchItem]] = {}
-    for bucket, query_list in queries.items():
-        merged: List[SearchItem] = []
-        for query in query_list:
-            time_range = "week" if days <= 10 else ("month" if days <= 45 else ("year" if days > 180 else None))
-            merged.extend(searxng_search(query, time_range=time_range, limit=limit, pages=pages))
+        if use_playwright:
+            playwright_obj = await async_playwright().start()
+            pw_browser = await playwright_obj.chromium.launch(headless=True)
+            pw_context = await pw_browser.new_context(user_agent=USER_AGENT)
 
-        merged = dedupe_by_url(merged)
-        merged.sort(key=lambda it: score_item(entity, it), reverse=True)
-        # Only now cut down to the top per_bucket to fetch content
-        buckets_raw[bucket] = merged[:per_bucket]
+        try:
+            fetch_tasks = []
+            doc_meta_map = [] # bucket, search_item
+            
+            seen_urls = set()
 
-    buckets_docs: Dict[str, List[Dict[str, Any]]] = {}
-    for bucket, items in buckets_raw.items():
-        docs = []
-        for it in items:
-            if not it.url:
-                continue
-            d = fetch_and_extract(it.url, use_playwright)
-            d["snippet"] = it.snippet
-            d["title"] = d["title"] or it.title
-            docs.append(d)
-            record_run_doc(run_id, bucket, d, score_item(entity, it))
-            time.sleep(0.2)
-        buckets_docs[bucket] = docs
+            for bucket, items in buckets_raw.items():
+                # Dedup and limit
+                unique_items = []
+                for it in items:
+                    if it.url and it.url not in seen_urls:
+                        seen_urls.add(it.url)
+                        unique_items.append(it)
+                
+                # Create fetch tasks
+                for it in unique_items[:per_bucket]:
+                    fetch_tasks.append(fetch_and_extract_async(session, pw_context, it.url, use_playwright))
+                    doc_meta_map.append((bucket, it))
 
-    # delta
-    delta = None
-    if prev_run_id:
-        prev_docs = get_run_docs(prev_run_id)
-        curr_docs = get_run_docs(run_id)
-        delta = compute_delta(prev_docs, curr_docs)
+            # Execute fetches
+            fetched_docs = await asyncio.gather(*fetch_tasks)
 
-    # If on watchlist, update last_run_id
-    with sqlite3.connect(DB_PATH) as con:
-        cur = con.execute("SELECT 1 FROM watchlist WHERE company_key=?", (ckey,))
-        if cur.fetchone():
+            # 3. Store Results
+            buckets_docs = {}
+            for i, doc in enumerate(fetched_docs):
+                bucket, search_item = doc_meta_map[i]
+                if bucket not in buckets_docs: buckets_docs[bucket] = []
+                
+                # Merge snippet if full text failed
+                if not doc["text"]: doc["snippet"] = search_item.snippet
+                
+                buckets_docs[bucket].append(doc)
+                record_run_doc(run_id, bucket, doc, 1.0) # Simplified score
+
+            # 4. LLM Analysis
+            llm_summary = await analyze_with_llm(session, entity["company"], buckets_docs)
+            record_run(run_id, company_input, llm_summary)
+            record_run_meta(run_id, ckey, company_input, days)
+            
+            # Watchlist update
             update_watchlist_last_run(ckey, run_id)
 
-    return {
-        "entity": entity,
-        "company_key": ckey,
-        "run_id": run_id,
-        "prev_run_id": prev_run_id,
-        "delta": delta,
-        "buckets_docs": buckets_docs,
-    }
+            return {
+                "entity": entity,
+                "run_id": run_id,
+                "buckets_docs": buckets_docs,
+                "llm_summary": llm_summary
+            }
 
-# --------------------------- CLI (Step 7 scheduling) ---------------------------
+        finally:
+            if pw_browser: await pw_browser.close()
+            if playwright_obj: await playwright_obj.stop()
 
-def cli_scan(args) -> int:
-    ensure_dir(args.out_dir)
-    result = run_scan(args.scan, args.days, args.per_bucket, args.use_playwright, deep_scan=args.deep_scan)
-    entity = result["entity"]
-    md = brief_markdown(entity, result["buckets_docs"], args.days, result["run_id"], result["delta"])
+# --------------------------- Reporting (PDF Fix) ---------------------------
 
-    fn = f"{datetime.now().strftime('%Y%m%d_%H%M')}_{safe_filename(company_key(entity))}.md"
-    path = f"{args.out_dir}/{fn}"
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(md)
-
-    print(f"[OK] Saved report: {path}")
-
-    # Also write a PDF next to the markdown (business-friendly)
-    pdf_fn = fn.replace(".md", ".pdf")
-    pdf_path = f"{args.out_dir}/{pdf_fn}"
-    pdf_lines = brief_to_pdf_lines(md)
-    write_pdf_report(pdf_path, f"Company brief: {entity['company']}", pdf_lines)
-    print(f"[OK] Saved PDF: {pdf_path}")
-    if result["delta"]:
-        print(f"     New: {result['delta']['counts']['new']} | Gone: {result['delta']['counts']['gone']}")
-    return 0
-
-def cli_watchlist_scan(args) -> int:
-    ensure_db()
-    ensure_dir(args.out_dir)
-    wl = list_watchlist()
-    if not wl:
-        print("[INFO] Watchlist empty. Add companies in the UI first.")
-        return 0
-
-    digest_lines = []
-    digest_lines.append(f"# Daily digest ({datetime.now().strftime('%Y-%m-%d %H:%M')})")
-    digest_lines.append("")
-
-    for w in wl:
-        company_input = w["input_value"]
-        try:
-            result = run_scan(company_input, args.days, args.per_bucket, args.use_playwright, deep_scan=args.deep_scan)
-            entity = result["entity"]
-            ckey = result["company_key"]
-            delta = result["delta"]
-
-            md = brief_markdown(entity, result["buckets_docs"], args.days, result["run_id"], delta)
-            fn = f"{datetime.now().strftime('%Y%m%d_%H%M')}_{safe_filename(ckey)}.md"
-            path = f"{args.out_dir}/{fn}"
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(md)
-
-            new_count = delta["counts"]["new"] if delta else 0
-            gone_count = delta["counts"]["gone"] if delta else 0
-            digest_lines.append(f"## {w['label']}")
-            digest_lines.append(f"- Report: {path}")
-            digest_lines.append(f"- New: **{new_count}** | Gone: **{gone_count}**")
-            digest_lines.append("")
-
-            update_watchlist_last_run(ckey, result["run_id"])
-            print(f"[OK] {w['label']} -> {path} (new={new_count}, gone={gone_count})")
-        except Exception as e:
-            print(f"[ERR] {w['label']}: {e}")
-            digest_lines.append(f"## {w['label']}")
-            digest_lines.append(f"- Error: {e}")
-            digest_lines.append("")
-
-    digest_fn = f"{datetime.now().strftime('%Y%m%d_%H%M')}_digest.md"
-    digest_path = f"{args.out_dir}/{digest_fn}"
-    with open(digest_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(digest_lines))
-
-    print(f"[OK] Saved digest: {digest_path}")
-
-
-    digest_pdf_path = f"{args.out_dir}/{datetime.now().strftime('%Y%m%d_%H%M')}_digest.pdf"
-    write_pdf_report(digest_pdf_path, "Daily Company Signals Digest", digest_lines)
-    print(f"[OK] Saved digest PDF: {digest_pdf_path}")
-    return 0
-
-def get_latest_run_for_company(company_key_: str) -> Optional[str]:
-    with sqlite3.connect(DB_PATH) as con:
-        cur = con.execute("""
-          SELECT run_id FROM run_meta
-          WHERE company_key=?
-          ORDER BY created_at DESC
-          LIMIT 1
-        """, (company_key_,))
-        row = cur.fetchone()
-    return row[0] if row else None
-
-def get_previous_run_for_company(company_key_: str, current_run_id: str) -> Optional[str]:
-    with sqlite3.connect(DB_PATH) as con:
-        cur = con.execute("""
-          SELECT run_id FROM run_meta
-          WHERE company_key=? AND run_id <> ?
-          ORDER BY created_at DESC
-          LIMIT 1
-        """, (company_key_, current_run_id))
-        row = cur.fetchone()
-    return row[0] if row else None
-
-def build_email_digest_for_watchlist(days_label: str = "last scan") -> str:
-    ensure_db()
-    wl = list_watchlist()
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
-
-    lines = []
-    lines.append(f"Subject: Daily Company Signals Digest ({now})")
-    lines.append("")
-    lines.append(f"Hi team,")
-    lines.append("")
-    lines.append(f"Here are the key updates from the {days_label}:")
-    lines.append("")
-
-    if not wl:
-        lines.append("- Watchlist is empty.")
-        return "\n".join(lines)
-
-    for w in wl:
-        ckey = w["company_key"]
-        label = w["label"]
-
-        latest = get_latest_run_for_company(ckey)
-        if not latest:
-            lines.append(f"{label}: No scans yet.")
-            lines.append("")
-            continue
-
-        prev = get_previous_run_for_company(ckey, latest)
-        if prev:
-            delta = compute_delta(get_run_docs(prev), get_run_docs(latest))
-        else:
-            delta = None
-
-        bullets = summarize_delta_exec(delta, max_items=4)
-        lines.append(f"{label}")
-        for b in bullets:
-            lines.append(f"- {b}")
-        lines.append("")
-
-    lines.append("Regards,")
-    lines.append("Local Company Research Agent")
-    return "\n".join(lines)
-
-def summarize_delta_exec(delta: Optional[Dict[str, Any]], max_items: int = 5) -> List[str]:
-    """
-    Returns short bullets like:
-    - News: 2 new items (example title…)
-    """
-    if not delta:
-        return ["No previous scan to compare yet."]
-
-    bullets = []
-    # flatten new items with bucket
-    flattened = []
-    for bucket, items in (delta.get("new") or {}).items():
-        for it in items:
-            flattened.append((bucket, it))
-
-    # prioritize buckets (business-friendly ordering)
-    bucket_order = {"news": 0, "people": 1, "reviews": 2, "chatter": 3, "company_site": 4}
-    flattened.sort(key=lambda x: bucket_order.get(x[0], 99))
-
-    # count per bucket
-    counts = {b: len(items) for b, items in (delta.get("new") or {}).items()}
-
-    # summary header bullets
-    total_new = delta.get("counts", {}).get("new", 0)
-    total_gone = delta.get("counts", {}).get("gone", 0)
-    bullets.append(f"New items found: {total_new}. Disappeared since last scan: {total_gone}.")
-
-    # per-bucket highlights + sample titles
-    for bucket in sorted(counts.keys(), key=lambda b: bucket_order.get(b, 99)):
-        n = counts[bucket]
-        if n <= 0:
-            continue
-        sample_titles = []
-        for (bb, it) in flattened:
-            if bb != bucket:
-                continue
-            t = it.get("title") or it.get("url")
-            if t:
-                sample_titles.append(t.strip())
-            if len(sample_titles) >= 2:
-                break
-        sample = " | ".join(sample_titles)
-        bullets.append(f"{bucket.replace('_',' ').title()}: {n} new — {sample}")
-
-        if len(bullets) >= max_items:
-            break
-
-    return bullets[:max_items]
-
-
-def write_pdf_report(pdf_path: str, title: str, lines: List[str]):
-    """
-    Very simple PDF writer using ReportLab.
-    """
-    c = canvas.Canvas(pdf_path, pagesize=A4)
-    width, height = A4
-
-    x = 2 * cm
-    y = height - 2 * cm
-    line_height = 14
+def write_pdf_report_platypus(pdf_path: str, title: str, summary: str, buckets_docs: Dict[str, List[Dict[str, Any]]]):
+    doc = SimpleDocTemplate(pdf_path, pagesize=A4, rightMargin=2*cm, leftMargin=2*cm, topMargin=2*cm, bottomMargin=2*cm)
+    styles = getSampleStyleSheet()
+    story = []
 
     # Title
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(x, y, title)
-    y -= 1.2 * cm
+    story.append(Paragraph(title, styles['Title']))
+    story.append(Spacer(1, 0.5*cm))
+    
+    # Date
+    date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    story.append(Paragraph(f"Generated on: {date_str}", styles['Normal']))
+    story.append(Spacer(1, 1*cm))
 
-    c.setFont("Helvetica", 10)
-    for raw in lines:
-        # wrap long lines crudely
-        text = raw.replace("\t", " ")
-        while len(text) > 120:
-            c.drawString(x, y, text[:120])
-            text = text[120:]
-            y -= line_height
-            if y < 2 * cm:
-                c.showPage()
-                c.setFont("Helvetica", 10)
-                y = height - 2 * cm
-        c.drawString(x, y, text)
-        y -= line_height
+    # LLM Summary Section
+    if summary:
+        story.append(Paragraph("Executive Summary", styles['Heading2']))
+        # Clean markdown bolding for PDF
+        clean_summary = summary.replace("**", "<b>").replace("n't", "n't") 
+        # Note: ReportLab simple markdown support is limited, standard text is safer
+        story.append(Paragraph(summary.replace("\n", "<br/>"), styles['BodyText']))
+        story.append(Spacer(1, 1*cm))
 
-        if y < 2 * cm:
-            c.showPage()
-            c.setFont("Helvetica", 10)
-            y = height - 2 * cm
+    # Findings by Bucket
+    for bucket, docs in buckets_docs.items():
+        if not docs: continue
+        story.append(Paragraph(bucket.replace("_", " ").title(), styles['Heading2']))
+        
+        for d in docs:
+            d_title = d.get('title') or d.get('url')
+            d_url = d.get('url')
+            d_source = d.get('source')
+            
+            # Item Title
+            story.append(Paragraph(f"<b>{d_title}</b>", styles['Heading4']))
+            # Source
+            story.append(Paragraph(f"<i>Source: {d_source}</i>", styles['Normal']))
+            # URL (Wrapped)
+            story.append(Paragraph(f"<a href='{d_url}' color='blue'>{d_url}</a>", styles['BodyText']))
+            story.append(Spacer(1, 0.3*cm))
+        
+        story.append(Spacer(1, 0.5*cm))
 
-    c.save()
+    try:
+        doc.build(story)
+    except Exception as e:
+        print(f"PDF Gen Error: {e}")
 
+def generate_markdown_report(entity, summary, buckets_docs):
+    lines = [f"# Research Report: {entity['company']}"]
+    lines.append(f"Date: {datetime.now().strftime('%Y-%m-%d')}\n")
+    
+    if summary:
+        lines.append("## Executive Summary (AI)")
+        lines.append(summary)
+        lines.append("\n---\n")
+    
+    for bucket, docs in buckets_docs.items():
+        lines.append(f"### {bucket.title()}")
+        for d in docs:
+            lines.append(f"- **{d.get('title') or 'Link'}** ({d.get('source')})")
+            lines.append(f"  - {d['url']}")
+        lines.append("")
+    return "\n".join(lines)
 
-def brief_to_pdf_lines(markdown_text: str) -> List[str]:
-    """
-    Convert markdown to plain-ish lines for PDF.
-    """
-    lines = []
-    for line in markdown_text.splitlines():
-        line = line.strip()
-        if line.startswith("#"):
-            line = line.lstrip("#").strip().upper()
-        # remove markdown bullets formatting a bit
-        line = line.replace("**", "")
-        lines.append(line)
-    return lines
-
-
-# --------------------------- Streamlit UI (Step 6) ---------------------------
+# --------------------------- UI ---------------------------
 
 def ui_main():
-    if st is None:
-        raise RuntimeError("streamlit is not installed in this environment. Install it or run CLI mode.")
+    st.set_page_config(page_title="Agent 0.2", layout="wide")
+    st.title("AI Market Research Agent")
+    st.caption(f"Powered by {LLM_MODEL} & SearXNG")
 
-    st.set_page_config(page_title="Local Company Research Agent", layout="wide")
-    ensure_db()
-
-    st.title("Local Company Research Agent")
-    st.caption("Local-first research: SearXNG search + extraction + watchlist + deltas + scheduled CLI scans.")
-
-    if st.session_state.get("digest_text"):
-        st.subheader("Email-style digest")
-        digest_text = st.session_state["digest_text"]
-        st.code(digest_text, language="text")
-
-        # Export digest as markdown + PDF too
-        ensure_dir("reports")
-        digest_md_path = f"reports/{datetime.now().strftime('%Y%m%d_%H%M')}_digest.txt"
-        with open(digest_md_path, "w", encoding="utf-8") as f:
-            f.write(digest_text)
-
-        digest_pdf_path = f"reports/{datetime.now().strftime('%Y%m%d_%H%M')}_digest.pdf"
-        write_pdf_report(digest_pdf_path, "Daily Company Signals Digest", digest_text.splitlines())
-
-        with open(digest_pdf_path, "rb") as f:
-            st.download_button("Download digest (PDF)", f, file_name=digest_pdf_path.split("/")[-1])
-
-
-    # Sidebar Watchlist
-    st.sidebar.header("Watchlist")
-    wl = list_watchlist()
-
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("Digest view (email-style)")
-    if st.sidebar.button("Generate digest text"):
-        st.session_state["digest_text"] = build_email_digest_for_watchlist("most recent scan")
-        st.rerun()
-
-
-    labels = ["(none)"] + [w["label"] for w in wl]
-    selected = st.sidebar.selectbox("Pick a company", labels)
-
-    if selected != "(none)":
-        chosen = next(w for w in wl if w["label"] == selected)
-        if st.sidebar.button("Load into search"):
-            st.session_state["q_prefill"] = chosen["input_value"]
-        if st.sidebar.button("Remove from watchlist"):
-            remove_from_watchlist(chosen["company_key"])
-            st.sidebar.success("Removed.")
-            st.rerun()
-
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("Scheduling (Step 7)")
-    st.sidebar.write("Use CLI commands with Windows Task Scheduler:")
-    st.sidebar.code(
-        'python app.py --watchlist-scan --days 30 --out-dir reports --deep-scan\n'
-        'python app.py --scan "acme.com" --days 30 --out-dir reports --deep-scan',
-        language="text"
-    )
-
-    prefill = st.session_state.get("q_prefill", "")
-    q = st.text_input("Company name or website", value=prefill, placeholder="e.g., acme.com or Acme Corporation")
-
-    col1, col2, col3 = st.columns([1, 1, 1])
+    q = st.text_input("Company / Topic")
+    
+    col1, col2 = st.columns(2)
     with col1:
-        days = st.slider("Recency window (days)", 7, 180, 30, step=1)
+        days = st.slider("Lookback Days", 7, 90, 30)
     with col2:
-        per_bucket = st.slider("Max items per section", 3, 20, 8, step=1)
-    with col3:
-        use_playwright = st.checkbox("Use Playwright fallback", value=True)
-    deep_scan = st.checkbox("Deep scan (slower, better coverage)", value=False)
+        use_playwright = st.checkbox("Deep Scraping (Slower)", value=True)
 
-    cA, cB = st.columns([1, 1])
-    with cA:
-        if st.button("Add to watchlist", disabled=not bool(q.strip())):
-            ent = normalize_company_input(q)
-            add_to_watchlist(ent, q)
-            st.success("Added to watchlist.")
-            st.rerun()
-
-    with cB:
-        st.write("")
-
-    if st.button("Research", type="primary", disabled=not bool(q.strip())):
-
-        with st.status("Running scan…", expanded=False) as status:
-            result = run_scan(q, days, per_bucket, use_playwright, deep_scan=deep_scan)
-            status.update(label="Done", state="complete")
-
-        entity = result["entity"]
-        buckets_docs = result["buckets_docs"]
-        run_id = result["run_id"]
-        prev_run_id = result["prev_run_id"]
-        delta = result["delta"]
-
-        st.subheader("Executive summary (Top 5)")
-        for b in summarize_delta_exec(delta, max_items=5):
-            st.write("• " + b)
-
-        st.subheader("What changed since last scan?")
-        if prev_run_id and delta:
-            st.write(f"New items: **{delta['counts']['new']}** | Disappeared: **{delta['counts']['gone']}**")
-
-            with st.expander("New items (by section)", expanded=True):
-                if delta["counts"]["new"] == 0:
-                    st.write("No new items.")
-                else:
-                    for bucket, items in delta["new"].items():
-                        st.markdown(f"**{bucket.replace('_',' ').title()}**")
-                        for it in items:
-                            st.markdown(f"- [{it.get('title') or it['url']}]({it['url']}) — {it.get('source','')}")
-            with st.expander("Disappeared items (by section)", expanded=False):
-                if delta["counts"]["gone"] == 0:
-                    st.write("No disappeared items.")
-                else:
-                    for bucket, items in delta["gone"].items():
-                        st.markdown(f"**{bucket.replace('_',' ').title()}**")
-                        for it in items:
-                            st.markdown(f"- [{it.get('title') or it['url']}]({it['url']}) — {it.get('source','')}")
-        else:
-            st.write("No previous scan found for this company yet. Run it once more to see deltas.")
-
-        left, right = st.columns([1, 1])
-        with left:
-            st.subheader("Results")
-            st.write(f"**Entity:** {entity['company']}")
-            if entity.get("domain"):
-                st.write(f"**Domain:** {entity['domain']}")
-            st.caption(f"Run ID: {run_id}")
-
-            for bucket, docs in buckets_docs.items():
-                st.markdown(f"### {bucket.replace('_',' ').title()}")
-                if not docs:
-                    st.write("No results.")
-                    continue
+    if st.button("Run Agent", type="primary"):
+        with st.status("Agent Working...", expanded=True) as status:
+            st.write("Searching & Scraping (Async)...")
+            
+            # Run the async scan loop
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                result = loop.run_until_complete(run_scan_async(q, days, 5, use_playwright))
+            except Exception as e:
+                st.error(f"Scan failed: {e}")
+                st.stop()
+            
+            status.update(label="Analysis Complete", state="complete")
+        
+        # Display Results
+        st.subheader("Executive Synthesis")
+        st.markdown(result["llm_summary"])
+        
+        st.divider()
+        st.subheader("Source Data")
+        for bucket, docs in result["buckets_docs"].items():
+            with st.expander(f"{bucket.title()} ({len(docs)})"):
                 for d in docs:
-                    pub_disp = fmt_pub(d.get("published_at"))
-                    st.markdown(f"**[{d.get('title') or '(untitled)'}]({d.get('url')})**")
-                    meta = f"{d.get('source')}"
-                    if pub_disp:
-                        meta += f" · {pub_disp}"
-                    st.caption(meta)
-                    if d.get("snippet"):
-                        st.write(d["snippet"])
-                    st.divider()
+                    st.write(f"**[{d['title']}]({d['url']})** - {d['source']}")
 
-        with right:
-            st.subheader("Export")
-            md = brief_markdown(entity, buckets_docs, days, run_id, delta)
-            st.download_button("Download brief (Markdown)", md, file_name=f"{safe_filename(company_key(entity))}_brief.md")
+        # Export
+        md_text = generate_markdown_report(result["entity"], result["llm_summary"], result["buckets_docs"])
+        st.download_button("Download Report (MD)", md_text, "report.md")
+        
+        # PDF
+        ensure_db() # ensures data dir
+        pdf_path = f"data/report_{result['run_id']}.pdf"
+        write_pdf_report_platypus(pdf_path, f"Research: {result['entity']['company']}", result["llm_summary"], result["buckets_docs"])
+        with open(pdf_path, "rb") as f:
+            st.download_button("Download Report (PDF)", f, "report.pdf")
 
-            ensure_dir("reports")
-            pdf_name = f"{safe_filename(company_key(entity))}_brief.pdf"
-            pdf_path = f"reports/{pdf_name}"
-
-            pdf_lines = brief_to_pdf_lines(md)
-            write_pdf_report(pdf_path, f"Company brief: {entity['company']}", pdf_lines)
-
-            with open(pdf_path, "rb") as f:
-                st.download_button("Download brief (PDF)", f, file_name=pdf_name)
-
-            st.subheader("Raw extracted text (debug)")
-            bucket_sel = st.selectbox("Section", list(buckets_docs.keys()))
-            if buckets_docs.get(bucket_sel):
-                doc_sel = st.selectbox("Document", [d.get("title") or d["url"] for d in buckets_docs[bucket_sel]])
-                chosen = None
-                for d in buckets_docs[bucket_sel]:
-                    if (d.get("title") or d["url"]) == doc_sel:
-                        chosen = d
-                        break
-                if chosen:
-                    st.code((chosen.get("text") or "")[:12000])
-            else:
-                st.write("No docs in this section.")
-
-    st.info("Tip: For scheduling, use CLI mode + Windows Task Scheduler to generate daily digest markdown files.")
-
-# --------------------------- entrypoint ---------------------------
-
-def parse_args():
-    p = argparse.ArgumentParser(description="Local Company Research Agent (UI + CLI scheduler)")
-    p.add_argument("--scan", type=str, help="Run a single scan for the given company name/domain input.")
-    p.add_argument("--watchlist-scan", action="store_true", help="Scan all watchlist entries and write a digest.")
-    p.add_argument("--days", type=int, default=30, help="Recency window in days.")
-    p.add_argument("--per-bucket", type=int, default=8, help="Max items per section.")
-    p.add_argument("--use-playwright", action="store_true", default=False, help="Enable Playwright fallback.")
-    p.add_argument("--no-playwright", action="store_true", help="Disable Playwright fallback.")
-    p.add_argument("--out-dir", type=str, default="reports", help="Output directory for markdown reports.")
-    p.add_argument("--deep-scan", action="store_true", help="Use more pages/candidates (slower, better recall).")
-    return p.parse_args()
-
-def main():
-    args = parse_args()
-    # normalize playwright flags
-    args.use_playwright = args.use_playwright or (not args.no_playwright)
-
-    if args.scan:
-        return cli_scan(args)
-    if args.watchlist_scan:
-        return cli_watchlist_scan(args)
-
-    # Default: UI mode (streamlit)
-    # When launched via `streamlit run app.py`, this main() is executed in that context.
-    ui_main()
-    return 0
+# --------------------------- Entry ---------------------------
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--scan", help="CLI mode scan")
+    args = parser.parse_args()
+
+    if args.scan:
+        print(f"Starting async scan for {args.scan}...")
+        res = asyncio.run(run_scan_async(args.scan, 30, 5, True))
+        print("\n=== SUMMARY ===\n")
+        print(res["llm_summary"])
+        pdf_name = f"report_{res['run_id']}.pdf"
+        write_pdf_report_platypus(pdf_name, args.scan, res["llm_summary"], res["buckets_docs"])
+        print(f"\nSaved PDF: {pdf_name}")
+    else:
+        ui_main()
