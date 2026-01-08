@@ -1,0 +1,29 @@
+use_default_settings: true
+
+server:
+  secret_key: "change_me_please"
+  limiter: false
+  image_proxy: true
+
+ui:
+  static_use_hash: true
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  formats:
+    - html
+    - json
+
+engines:
+  - name: google
+    disabled: true
+  - name: bing
+    disabled: false
+  - name: duckduckgo
+    disabled: false
+  - name: brave
+    disabled: true
+
+outgoing:
+  request_timeout: 10.0
