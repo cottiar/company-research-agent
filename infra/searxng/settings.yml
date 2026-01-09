@@ -17,11 +17,11 @@ search:
 
 engines:
   - name: google
-    disabled: true
+    disabled: false
   - name: bing
-    disabled: false
+    disabled: true
   - name: duckduckgo
-    disabled: false
+    disabled: true
   - name: brave
     disabled: true
 

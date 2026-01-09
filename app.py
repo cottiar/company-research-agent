@@ -162,37 +162,70 @@ async def run_agent(company, days, deep_scrape, api_cfg):
     run_id = str(uuid.uuid4())
     status = st.status("Agent Started", expanded=True)
     
-    # --- STRATEGY: TIME-BASED FILTERING ---
-    # We don't ask for "CEO" specifically. We ask for "Everything new".
-    # We run parallel searches: 
-    # 1. "Last Month" (Strict) - catches breaking news (CEO, earnings, lawsuits)
-    # 2. "General" (Broad) - catches context, competitors, and older major events
-    
     async with aiohttp.ClientSession() as session:
-        # --- PHASE 2: SEARCHING ---
-        status.write(f"🔍 Searching last 30 days of news for {company}...")
+        # --- PHASE 1: AGGRESSIVE SEARCHING ---
+        status.write(f"🔍 Casting a wider net for {company} (Last 30 Days)...")
         
+        # We increase limits and add specific "Hunter" queries to catch what was missed
         search_tasks = [
-            # 1. STRICT RECENCY (The "News" Filter)
-            search_searxng(session, f'"{company}" news', limit=5, time_range="month"),
-            search_searxng(session, f'"{company}" press release', limit=3, time_range="month"),
-            search_searxng(session, f'"{company}" business', limit=3, time_range="month"),
+            # 1. Broad News (High volume to overcome ranking noise)
+            search_searxng(session, f'"{company}" news', limit=30, time_range="month"),
             
-            # 2. BROADER CONTEXT (No time limit, but low count)
-            search_searxng(session, f'"{company}" strategic outlook', limit=2),
-            search_searxng(session, f'"{company}" competitors', limit=2)
+            # 2. Targeted "Leadership" Queries (catches CEO changes specifically)
+            # search_searxng(session, f'"{company}" ceo resignation', limit=10, time_range="month"),
+            search_searxng(session, f'"{company}" executive leadership team', limit=10, time_range="month"),
+            search_searxng(session, f'"{company}" board of directors', limit=10, time_range="month"),
+            
+            # 3. Official/Financial channels
+            search_searxng(session, f'"{company}" investor relations press release', limit=10, time_range="month"),
+            search_searxng(session, f'"{company}" sec filing 8-k', limit=5, time_range="month"),
         ]
         
         results_nested = await asyncio.gather(*search_tasks)
         
-        all_links = {}
+        # --- PHASE 2: SMART RANKING & DEDUPLICATION ---
+        # We flatten the list and score items to find the "needle in the haystack"
+        unique_links = {}
+        
+        # Keywords that indicate High Value info
+        high_priority_terms = ["resigned", "steps down", "appointed", "named ceo", "interim", "strategic review", "filing"]
+        
+        scored_items = []
+        
         for res_list in results_nested:
             for item in res_list:
-                if item.url not in all_links:
-                    all_links[item.url] = item
+                if item.url in unique_links:
+                    continue
+                
+                unique_links[item.url] = item
+                score = 0
+                
+                # Simple scoring heuristic
+                content_blob = (item.title + " " + item.snippet).lower()
+                
+                # Boost for keywords
+                for term in high_priority_terms:
+                    if term in content_blob:
+                        score += 10
+                
+                # Boost for official sources
+                if "investors." in item.url or "sec.gov" in item.url or "prnewswire" in item.url:
+                    score += 5
+                    
+                # Penalize generic homepages (they usually lack specific news text)
+                if item.url.strip("/").endswith(".com") or item.url.strip("/").endswith(company.replace(" ", "").lower() + ".com"):
+                    score -= 5
+                    
+                scored_items.append({"item": item, "score": score})
+
+        # Sort by score (descending) so we scrape the most relevant "leadership" news first
+        scored_items.sort(key=lambda x: x["score"], reverse=True)
+        
+        # Take Top 15 Highest Scored items (instead of just random top 5)
+        final_scrape_list = [x["item"] for x in scored_items[:15]]
 
         # --- PHASE 3: SCRAPING ---
-        status.write(f"📖 Reading {len(all_links)} pages (Concurrency Limited)...")
+        status.write(f"📖 Reading {len(final_scrape_list)} high-priority pages...")
         
         pw_obj = None
         pw_browser = None
@@ -205,13 +238,14 @@ async def run_agent(company, days, deep_scrape, api_cfg):
 
         sem = asyncio.Semaphore(4) 
         
-        async def protected_fetch(url):
+        async def protected_fetch(item):
             async with sem:
-                res = await fetch_page(session, pw_context, url, deep_scrape)
-                res["title"] = all_links[url].title
+                # Pass the item title along so we can track it
+                res = await fetch_page(session, pw_context, item.url, deep_scrape)
+                res["title"] = item.title 
                 return res
 
-        fetch_tasks = [protected_fetch(url) for url in all_links.keys()]
+        fetch_tasks = [protected_fetch(item) for item in final_scrape_list]
         docs = await asyncio.gather(*fetch_tasks)
 
         if pw_browser: await pw_browser.close()
@@ -223,10 +257,11 @@ async def run_agent(company, days, deep_scrape, api_cfg):
         context_text = ""
         for d in docs:
             if d.get("text"):
-                # We feed the AI up to 8000 chars per article to ensure it sees the "meat" of the news
-                context_text += f"\n=== SOURCE: {d['title']} ({d['url']}) ===\n{d['text'][:8000]}\n"
+                # Clean up newlines to save tokens
+                clean_text = re.sub(r'\n+', '\n', d['text'][:8000])
+                context_text += f"\n=== SOURCE: {d.get('title', 'Untitled')} ({d['url']}) ===\n{clean_text}\n"
         
-        # --- PROMPT: GENERAL INTELLIGENCE ---
+        # --- PROMPT ---
         prompt = f"""
         You are an expert market intelligence agent.
         
@@ -234,21 +269,21 @@ async def run_agent(company, days, deep_scrape, api_cfg):
         TODAY'S DATE: {datetime.now().strftime('%Y-%m-%d')}
         
         INSTRUCTIONS:
-        1. Review the SOURCE DATA below, which includes news from the **last 30 days**.
-        2. Identify the **Single Most Important Event** that happened recently (e.g., leadership change, big acquisition, earnings shock).
-        3. List other key developments.
-        4. If the news mentions a specific date, cite it.
+        1. Review the SOURCE DATA below (News from last 30 days).
+        2. Identify the **Single Most Important Event** (e.g., CEO resignation, M&A, Earnings).
+        3. If there is a leadership change, be very specific about WHO left, WHO joined, and the EFFECTIVE DATES.
+        4. List other key business developments.
         
         OUTPUT FORMAT:
-        # 🚨 Breaking / Major News (Last 30 Days)
-        [If a major event occurred (like a CEO leaving, a lawsuit, or a merger), detail it here FIRST. Be specific.]
+        # 🚨 Breaking / Major News
+        [Detail the biggest event here. If a CEO stepped down, mention the name and date explicitly.]
+        
+        # Leadership & Governance
+        - [Details on executive changes]
         
         # Key Business Updates
         - [Update 1]
         - [Update 2]
-        
-        # Market Sentiment
-        [Brief Summary]
         
         SOURCE DATA:
         {context_text}
@@ -260,7 +295,7 @@ async def run_agent(company, days, deep_scrape, api_cfg):
         
         status.update(label="Complete!", state="complete", expanded=False)
         return {"summary": summary, "docs": docs, "run_id": run_id}
-        
+         
 # --------------------------- PDF REPORTING ---------------------------
 
 def create_pdf(filename, company, summary, docs):
