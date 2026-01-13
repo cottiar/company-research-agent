@@ -244,16 +244,17 @@ async def run_agent(company, days, deep_scrape, api_cfg):
         # We increase limits and add specific "Hunter" queries to catch what was missed
         search_tasks = [
             # 1. Broad News (High volume to overcome ranking noise)
-            search_tavily_2(tavily, f'"{company}" news', limit=30, time_range="month"),
+            # search_tavily_2(tavily, f'"{company}" news', limit=30, time_range="month"),
+            search_tavily_2(tavily, f'"{company}" Glassdoor, Indeed, AmbitionBox, LinkedIn, employee, reviews', limit=30, time_range="month"),
             
             # 2. Targeted "Leadership" Queries (catches CEO changes specifically)
             # search_tavily_2(session, f'"{company}" ceo resignation', limit=10, time_range="month"),
-            search_tavily_2(tavily, f'"{company}" executive leadership team', limit=10, time_range="month"),
-            search_tavily_2(tavily, f'"{company}" board of directors', limit=10, time_range="month"),
+            # search_tavily_2(tavily, f'"{company}" executive leadership team', limit=10, time_range="month"),
+            # search_tavily_2(tavily, f'"{company}" board of directors', limit=10, time_range="month"),
             
             # 3. Official/Financial channels
-            search_tavily_2(tavily, f'"{company}" investor relations press release', limit=10, time_range="month"),
-            search_tavily_2(tavily, f'"{company}" sec filing 8-k', limit=5, time_range="month"),
+            # search_tavily_2(tavily, f'"{company}" investor relations press release', limit=10, time_range="month"),
+            # search_tavily_2(tavily, f'"{company}" sec filing 8-k', limit=5, time_range="month"),
         ]
         
         results_nested = await asyncio.gather(*search_tasks)
@@ -482,7 +483,8 @@ def main():
             default_mode = 0 if os.getenv("AI_PROVIDER") == "ollama" else 1
             
             with col1:
-                mode = st.radio("AI Backend", ["Local (Ollama)", "Cloud (Groq/OpenAI)"], index=default_mode)
+                # mode = st.radio("AI Backend", ["Local (Ollama)", "Cloud (Groq/OpenAI)"], index=default_mode)
+                mode = st.radio("AI Backend", ["Cloud (Groq/OpenAI)"], index=default_mode)
             with col2:
                 if "Cloud" in mode:
                     api_key = st.text_input("API Key", type="password", value=os.getenv("GROQ_API_KEY", ""))
