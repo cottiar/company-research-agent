@@ -1,0 +1,7 @@
+streamlit
+aiohttp
+playwright
+trafilatura
+reportlab
+nest_asyncio
+python-dotenv

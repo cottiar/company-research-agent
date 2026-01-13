@@ -10,11 +10,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from urllib.parse import urlparse
 
+
 # --- 3rd Party ---
 import aiohttp
 import sqlite3
 import nest_asyncio
 from dotenv import load_dotenv  # <--- NEW IMPORT
+from tavily import TavilyClient
 
 # PDF & Scraping
 from playwright.async_api import async_playwright
@@ -91,6 +93,7 @@ class SearchResult:
     title: str
     url: str
     snippet: str
+    source: str = "Web"
 
 async def search_searxng(session, query, limit=5, time_range=None):
     """
@@ -116,7 +119,54 @@ async def search_searxng(session, query, limit=5, time_range=None):
     except Exception as e:
         print(f"Search Error [{query}]: {e}")
         return []
+
+async def search_tavily(session, query, limit=5, time_range=None):
+    api_key = os.getenv("TAVILY_API_KEY", "")
+    TAVILY_URL = os.getenv("TAVILY_URL", "https://api.tavily.com/search")
     
+    payload = {
+        "query": query,
+        "max_results": limit,
+        "search_depth": "basic",
+        "include_answer": False,
+        "include_raw_content": False
+    }
+    
+    async with session.post(TAVILY_URL, json=payload) as response:
+        data = await response.json()
+        results = []
+        for item in data.get("results", []):
+            # Convert Tavily format to your app's SearchResult format
+            results.append(SearchResult(
+                url=item.get("url"),
+                title=item.get("title"),
+                snippet=item.get("content"),
+                source="Tavily"
+            ))
+        return results
+
+async def search_tavily_2(session, query, limit=5, time_range=None):
+    api_key = os.getenv("TAVILY_API_KEY", "")
+    client = TavilyClient(api_key)
+    response = client.search(
+        query=query,
+        include_answer="advanced",
+        topic="news",
+        search_depth="advanced",
+        max_results=limit,
+        time_range=time_range
+    )
+    results = []
+    for item in response.get("results", []):
+        # Convert Tavily format to your app's SearchResult format
+        results.append(SearchResult(
+            url=item.get("url"),
+            title=item.get("title"),
+            snippet=item.get("content"),
+            source="Tavily"
+        ))
+    return results
+
 async def fetch_page(session, context, url, use_playwright=False):
     text = ""
     try:
@@ -156,6 +206,27 @@ async def llm_analyze(session, api_base, api_key, model, prompt):
     except Exception as e:
         return f"LLM Connection Failed: {e}"
 
+class AiohttpTavilyClient:
+    """
+    A lightweight wrapper to make an aiohttp.ClientSession act like a TavilyClient.
+    """
+    def __init__(self, session: aiohttp.ClientSession, api_key: str):
+        self.session = session
+        self.api_key = api_key
+        self.base_url = "https://api.tavily.com/search"
+
+    async def search(self, query: str, **kwargs):
+        payload = {
+            "api_key": self.api_key,
+            "query": query,
+            # Merge in any other arguments (e.g., search_depth="advanced")
+            **kwargs 
+        }
+        
+        async with self.session.post(self.base_url, json=payload) as response:
+            response.raise_for_status()
+            return await response.json()
+
 # --------------------------- MAIN LOGIC ---------------------------
 
 async def run_agent(company, days, deep_scrape, api_cfg):
@@ -163,22 +234,26 @@ async def run_agent(company, days, deep_scrape, api_cfg):
     status = st.status("Agent Started", expanded=True)
     
     async with aiohttp.ClientSession() as session:
+
+        # "Convert" the session to a Tavily client
+        tavily = AiohttpTavilyClient(session, api_key="YOUR_API_KEY")
+
         # --- PHASE 1: AGGRESSIVE SEARCHING ---
         status.write(f"🔍 Casting a wider net for {company} (Last 30 Days)...")
         
         # We increase limits and add specific "Hunter" queries to catch what was missed
         search_tasks = [
             # 1. Broad News (High volume to overcome ranking noise)
-            search_searxng(session, f'"{company}" news', limit=30, time_range="month"),
+            search_tavily_2(tavily, f'"{company}" news', limit=30, time_range="month"),
             
             # 2. Targeted "Leadership" Queries (catches CEO changes specifically)
-            # search_searxng(session, f'"{company}" ceo resignation', limit=10, time_range="month"),
-            search_searxng(session, f'"{company}" executive leadership team', limit=10, time_range="month"),
-            search_searxng(session, f'"{company}" board of directors', limit=10, time_range="month"),
+            # search_tavily_2(session, f'"{company}" ceo resignation', limit=10, time_range="month"),
+            search_tavily_2(tavily, f'"{company}" executive leadership team', limit=10, time_range="month"),
+            search_tavily_2(tavily, f'"{company}" board of directors', limit=10, time_range="month"),
             
             # 3. Official/Financial channels
-            search_searxng(session, f'"{company}" investor relations press release', limit=10, time_range="month"),
-            search_searxng(session, f'"{company}" sec filing 8-k', limit=5, time_range="month"),
+            search_tavily_2(tavily, f'"{company}" investor relations press release', limit=10, time_range="month"),
+            search_tavily_2(tavily, f'"{company}" sec filing 8-k', limit=5, time_range="month"),
         ]
         
         results_nested = await asyncio.gather(*search_tasks)
